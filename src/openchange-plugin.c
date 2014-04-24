@@ -18,7 +18,9 @@
  */
 
 #include "openchange-plugin.h"
+#include <stdio.h>
 #include <dovecot/lib.h>
+#include <dovecot/compat.h>
 #include <dovecot/llist.h>
 #include <dovecot/mail-user.h>
 #include <dovecot/mail-storage-hooks.h>
@@ -26,6 +28,8 @@
 #include <dovecot/mail-storage-private.h>
 #include <dovecot/module-context.h>
 #include <dovecot/notify-plugin.h>
+#include <amqp.h>
+#include <amqp_tcp_socket.h>
 
 #define	OPENCHANGE_USER_CONTEXT(obj) \
 	MODULE_CONTEXT(obj, openchange_user_module)
@@ -67,34 +71,229 @@ struct openchange_user {
 	union mail_user_module_context	module_ctx;
 	enum openchange_field		fields;
 	enum openchange_event		events;
-	char				*username;
+	const char			*username;
+	const char			*broker_host;
+	unsigned int			broker_port;
+	const char			*broker_user;
+	const char			*broker_pass;
+	const char			*broker_exchange;
+	const char			*broker_routing;
+	amqp_connection_state_t		broker_conn;
+	amqp_socket_t			*broker_socket;
 };
 
 struct openchange_message {
 	struct openchange_message	*prev;
 	struct openchange_message	*next;
 	enum openchange_event		event;
-	//bool				ignore;
 	uint32_t			uid;
-	char				*destination_folder;
-	char				*username;
+	const char			*destination_folder;
 };
 
 struct openchange_mail_txn_context {
-	pool_t pool;
-	struct openchange_message *messages;
-	struct openchange_message *messages_tail;
+	pool_t				pool;
+	struct mail_namespace		*ns;
+	struct openchange_message	*messages;
+	struct openchange_message	*messages_tail;
 };
 
 static MODULE_CONTEXT_DEFINE_INIT(openchange_user_module,
 				  &mail_user_module_register);
 
+	int
+openchange_broker_err(char *buffer, int buffer_len, amqp_rpc_reply_t r)
+{
+	int ret;
+
+	ret = 0;
+	switch (r.reply_type) {
+	case AMQP_RESPONSE_NORMAL:
+		ret = snprintf(buffer, buffer_len, "normal response");
+		break;
+	case AMQP_RESPONSE_NONE:
+		snprintf(buffer, buffer_len, "missing RPC reply type");
+		break;
+	case AMQP_RESPONSE_LIBRARY_EXCEPTION:
+		ret = snprintf(buffer, buffer_len, "%s",
+			amqp_error_string2(r.library_error));
+		break;
+	case AMQP_RESPONSE_SERVER_EXCEPTION:
+		switch (r.reply.id) {
+		case AMQP_CONNECTION_CLOSE_METHOD:
+		{
+			amqp_connection_close_t *m;
+			m = (amqp_connection_close_t *) r.reply.decoded;
+			ret = snprintf(buffer, buffer_len,
+				"server connection error %d, message: %.*s",
+				m->reply_code,
+				(int) m->reply_text.len,
+				(char *) m->reply_text.bytes);
+			break;
+		}
+		case AMQP_CHANNEL_CLOSE_METHOD:
+		{
+			amqp_channel_close_t *m;
+			m = (amqp_channel_close_t *) r.reply.decoded;
+			ret = snprintf(buffer, buffer_len,
+				"server channel error %d, message: %.*s",
+				m->reply_code,
+				(int) m->reply_text.len,
+				(char *) m->reply_text.bytes);
+			break;
+		}
+		default:
+		{
+			ret = snprintf(buffer, buffer_len,
+				"unknown server error, method id 0x%08X",
+				r.reply.id);
+		}
+		break;
+		}
+		break;
+	}
+
+	return ret;
+}
+
+/**
+ * Close broker connection
+ */
+	static void
+openchange_broker_disconnect(struct openchange_user *user)
+{
+	amqp_rpc_reply_t r;
+	int ret;
+
+	if (user->broker_conn != NULL) {
+		i_debug("openchange: Closing broker channel");
+		r = amqp_channel_close(
+			user->broker_conn, 1, AMQP_REPLY_SUCCESS);
+		if (r.reply_type != AMQP_RESPONSE_NORMAL) {
+			char buffer[512];
+			openchange_broker_err(buffer, sizeof(buffer), r);
+			i_error("openchange: Failed to close channel: %s",
+				buffer);
+		}
+
+		i_debug("openchange: Closing broker connection");
+		r = amqp_connection_close(
+			user->broker_conn, AMQP_REPLY_SUCCESS);
+		if (r.reply_type != AMQP_RESPONSE_NORMAL) {
+			char buffer[512];
+			openchange_broker_err(buffer, sizeof(buffer), r);
+			i_error("openchange: Failed to close connection: %s",
+				buffer);
+		}
+
+		ret = amqp_destroy_connection(user->broker_conn);
+		if (ret != AMQP_STATUS_OK) {
+			i_error("openchange: Failed to destroy broker connection: %s",
+				amqp_error_string2(ret));
+			return;
+		}
+	}
+	user->broker_conn = NULL;
+	user->broker_socket = NULL;
+}
+
+
+/**
+ * Connect to broker
+ */
+	static bool
+openchange_broker_connect(struct openchange_user *user)
+{
+	amqp_rpc_reply_t r;
+	int ret;
+
+	i_debug("openchange: Initializing broker connection");
+	user->broker_conn = amqp_new_connection();
+	if (user->broker_conn == NULL) {
+		i_error("openchange: Failed to initialize broker connection");
+		openchange_broker_disconnect(user);
+		return FALSE;
+	}
+
+	i_debug("openchange: Initializing TCP socket");
+	user->broker_socket = amqp_tcp_socket_new(user->broker_conn);
+	if (user->broker_socket == NULL) {
+		i_error("openchange: Failed to initialize TCP socket");
+		openchange_broker_disconnect(user);
+		return FALSE;
+	}
+
+	i_debug("openchange: Connecting to broker %s:%u",
+			user->broker_host, user->broker_port);
+	ret = amqp_socket_open(user->broker_socket,
+			user->broker_host, user->broker_port);
+	if (ret != AMQP_STATUS_OK) {
+		i_error("openchange: Failed to connect to broker: %s",
+				amqp_error_string2(ret));
+		openchange_broker_disconnect(user);
+		return FALSE;
+	}
+
+	i_debug("openchange: Logging into broker");
+	r = amqp_login(user->broker_conn,
+			"/",				/* Virtual host */
+			AMQP_DEFAULT_MAX_CHANNELS,
+			AMQP_DEFAULT_FRAME_SIZE,
+			0,				/* Hearbeat */
+			AMQP_SASL_METHOD_PLAIN,
+			user->broker_user,
+			user->broker_pass);
+	if (r.reply_type != AMQP_RESPONSE_NORMAL) {
+		char buffer[512];
+		openchange_broker_err(buffer, sizeof(buffer), r);
+		i_error("openchange: Failed to log in: %s", buffer);
+		openchange_broker_disconnect(user);
+		return FALSE;
+	}
+
+	i_debug("openchange: Opening broker channel");
+	amqp_channel_open(user->broker_conn, 1);
+	r = amqp_get_rpc_reply(user->broker_conn);
+	if (r.reply_type != AMQP_RESPONSE_NORMAL) {
+		char buffer[512];
+		openchange_broker_err(buffer, sizeof(buffer), r);
+		i_error("openchange: Failed to open channel: %s", buffer);
+		openchange_broker_disconnect(user);
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
 /**
  * Publish a new message
  */
-	static void
-openchange_publish(const struct openchange_message *msg)
+	static bool
+openchange_publish(const struct openchange_user *user, const struct openchange_message *msg)
 {
+	amqp_rpc_reply_t r;
+	amqp_bytes_t payload;
+	int ret;
+
+	if (user->broker_conn != NULL) {
+		payload.len = 0;
+		payload.bytes = NULL;
+
+		ret = amqp_basic_publish(user->broker_conn,
+			1,
+			amqp_cstring_bytes(user->broker_exchange),
+			amqp_cstring_bytes(user->broker_routing),
+			0,	/* Mandatory */
+			0,	/* Inmediate */
+			NULL,	/* Properties */
+			payload);
+		if (ret != AMQP_STATUS_OK) {
+			i_error("openchange: Failed to publish: %s",
+				amqp_error_string2(ret));
+			return FALSE;
+		}
+	}
+
+	return TRUE;
 }
 
 /**
@@ -105,38 +304,62 @@ openchange_publish(const struct openchange_message *msg)
 openchange_mail_user_created(struct mail_user *user)
 {
 	struct openchange_user *ocuser;
-	//const char *str;
+	const char *str;
 
-	i_debug("%s: enter", __func__);
+	i_debug("openchange: %s enter", __func__);
 	ocuser = p_new(user->pool, struct openchange_user, 1);
 	MODULE_CONTEXT_SET(user, openchange_user_module, ocuser);
 
 	ocuser->fields = OPENCHANGE_DEFAULT_FIELDS;
 	ocuser->events = OPENCHANGE_DEFAULT_EVENTS;
 	ocuser->username = p_strdup(user->pool, user->username);
-	//str = mail_user_plugin_getenv(user, "ocsmanager_backend");
-	//if (!str) {
-	//	i_fatal("Missing ocsmanager_backend parameter in dovecot.conf");
-	//}
-	//ocsuser->backend = str;
-	//str = mail_user_plugin_getenv(user, "ocsmanager_newmail");
-	//if (!str) {
-	//	i_fatal("Missing ocsmanager_newmail parameter in dovecot.conf");
-	//}
-	//ocsuser->bin = str;
-	//str = mail_user_plugin_getenv(user, "ocsmanager_config");
-	//if (!str) {
-	//	i_fatal("Missing ocsmanager_config parameter in dovecot.conf");
-	//}
-	//ocsuser->config = str;
-	i_debug("%s: exit", __func__);
+
+	/* Read plugin configuration and store in module context */
+	str = mail_user_plugin_getenv(user, "openchange_broker_host");
+	if (str == NULL) {
+		i_error("openchange: Missing openchange_broker_host parameter");
+	}
+	ocuser->broker_host = str;
+
+	str = mail_user_plugin_getenv(user, "openchange_broker_port");
+	if (str == NULL) {
+		i_error("openchange: Missing openchange_broker_port parameter");
+	}
+	if (str_to_uint(str, &ocuser->broker_port) < 0) {
+		i_error("openchange: Invalid openchange_broker_port value");
+	}
+
+	str = mail_user_plugin_getenv(user, "openchange_broker_user");
+	if (str == NULL) {
+		i_error("openchange: Missing openchange_broker_user parameter");
+	}
+	ocuser->broker_user = str;
+
+	str = mail_user_plugin_getenv(user, "openchange_broker_pass");
+	if (str == NULL) {
+		i_error("openchange: Missing openchange_broker_pass parameter");
+	}
+	ocuser->broker_pass = str;
+
+	str = mail_user_plugin_getenv(user, "openchange_broker_exchange");
+	if (str == NULL) {
+		i_error("openchange: Missing openchange_broker_exchange parameter");
+	}
+	ocuser->broker_exchange = str;
+
+	str = mail_user_plugin_getenv(user, "openchange_broker_routing_key");
+	if (str == NULL) {
+		i_error("openchange: Missing openchange_broker_routing_key parameter");
+	}
+	ocuser->broker_routing = str;
+	i_debug("openchange: %s exit", __func__);
 }
 
 	static void
 openchange_mail_save(void *txn, struct mail *mail)
 {
-	i_debug("%s: enter", __func__);
-	i_debug("%s: exit", __func__);
+	i_debug("openchange: %s enter", __func__);
+	i_debug("openchange: %s exit", __func__);
 }
 
 	static void
@@ -144,45 +367,35 @@ openchange_mail_copy(void *txn, struct mail *src, struct mail *dst)
 {
 	struct openchange_mail_txn_context *ctx;
 	struct openchange_message *msg;
-	struct openchange_user *mctx;
+	struct openchange_user *ocuser;
 	int i;
 
-	i_debug("%s: enter", __func__);
+	i_debug("openchange: %s enter", __func__);
 	ctx = (struct openchange_mail_txn_context *) txn;
-	mctx = OPENCHANGE_USER_CONTEXT(dst->box->storage->user);
+	ocuser = OPENCHANGE_USER_CONTEXT(dst->box->storage->user);
 	if (strcmp(src->box->storage->name, "raw") == 0) {
 		/* special case: lda/lmtp is saving a mail */
 		msg = p_new(ctx->pool, struct openchange_message, 1);
 		msg->event = OPENCHANGE_EVENT_COPY;
 		msg->uid = 0;
-		msg->username = p_strdup(ctx->pool, mctx->username);
 		msg->destination_folder = p_strdup(ctx->pool, mailbox_get_name(dst->box));
-		//msg->ignore = FALSE;
-		//msg->backend = p_strdup(ctx->pool, mctx->backend);
-		//msg->bin = p_strdup(ctx->pool, mctx->bin);
-		//msg->config = p_strdup(ctx->pool, mctx->config);
-
-		/* FIXME: Quick hack of the night */
-		//msg->username[0] = toupper(msg->username[0]);
-		//for (i = 0; i < strlen(msg->destination_folder); i++) {
-		//	msg->destination_folder[i] = tolower(msg->destination_folder[i]);
-		//}
 		DLLIST2_APPEND(&ctx->messages, &ctx->messages_tail, msg);
 	}
-	i_debug("%s: exit", __func__);
+	i_debug("openchange: %s exit", __func__);
 }
 
 	static void *
-openchange_mail_transaction_begin(struct mailbox_transaction_context *t ATTR_UNUSED)
+openchange_mail_transaction_begin(struct mailbox_transaction_context *t)
 {
 	struct openchange_mail_txn_context *ctx;
 	pool_t pool;
 
-	i_debug("%s: enter", __func__);
+	i_debug("openchange: %s enter", __func__);
 	pool = pool_alloconly_create("openchange", 2048);
 	ctx = p_new(pool, struct openchange_mail_txn_context, 1);
 	ctx->pool = pool;
-	i_debug("%s: exit", __func__);
+	ctx->ns = mailbox_get_namespace(t->box);
+	i_debug("openchange: %s exit", __func__);
 
 	return ctx;
 }
@@ -192,28 +405,41 @@ openchange_mail_transaction_commit(void *txn, struct mail_transaction_commit_cha
 {
 	struct openchange_mail_txn_context *ctx;
 	struct openchange_message *msg;
+	struct openchange_user *ocuser;
 	struct seq_range_iter iter;
 	unsigned int n = 0;
 	uint32_t uid;
 
-	i_debug("%s: enter", __func__);
+	i_debug("openchange: %s enter", __func__);
 	ctx = (struct openchange_mail_txn_context *)txn;
+	ocuser = OPENCHANGE_USER_CONTEXT(ctx->ns->user);
+
+	/* Open connection to broker */
+	if (!openchange_broker_connect(ocuser)) {
+		pool_unref(&ctx->pool);
+		return;
+	}
+
+	/* Send notifications for new mails */
 	seq_range_array_iter_init(&iter, &changes->saved_uids);
 	for (msg = ctx->messages; msg != NULL; msg = msg->next) {
-		i_debug("%s: Message event: 0x%02X", __func__, msg->event);
 		if (msg->event == OPENCHANGE_EVENT_COPY) {
-		    // XXX || msg->event == OPENCHANGE_EVENT_SAVE) {
 			if (seq_range_array_iter_nth(&iter, n++, &uid)) {
 				msg->uid = uid;
-				i_debug("%s: Message username: %s, Message folder: %s, Message uid: %u",
-					__func__, msg->username, msg->destination_folder, msg->uid);
-				openchange_publish(msg);
+				i_debug("openchange: Message username: %s, Message folder: %s, Message uid: %u",
+					ocuser->username, msg->destination_folder, msg->uid);
+				openchange_publish(ocuser, msg);
 			}
 		}
 	}
+
 	i_assert(!seq_range_array_iter_nth(&iter, n, &uid));
+
+	/* Close connection to broker */
+	openchange_broker_disconnect(ocuser);
+
 	pool_unref(&ctx->pool);
-	i_debug("%s: exit", __func__);
+	i_debug("openchange: %s exit", __func__);
 }
 
 	static void
@@ -221,10 +447,10 @@ openchange_mail_transaction_rollback(void *txn)
 {
 	struct openchange_mail_txn_context *ctx;
 
-	i_debug("%s: enter", __func__);
+	i_debug("openchange: %s enter", __func__);
 	ctx = (struct openchange_mail_txn_context *)txn;
 	pool_unref(&ctx->pool);
-	i_debug("%s: exit", __func__);
+	i_debug("openchange: %s exit", __func__);
 }
 
 static const struct notify_vfuncs openchange_vfuncs = {
@@ -242,18 +468,18 @@ static struct mail_storage_hooks openchange_mail_storage_hooks = {
 	void
 openchange_plugin_init(struct module *module)
 {
-	i_debug("%s: enter", __func__);
+	i_debug("openchange: %s enter", __func__);
 	openchange_ctx = notify_register(&openchange_vfuncs);
 	mail_storage_hooks_add(module, &openchange_mail_storage_hooks);
-	i_debug("%s: exit", __func__);
+	i_debug("openchange: %s exit", __func__);
 }
 
 	void
 openchange_plugin_deinit(void)
 {
-	i_debug("%s: enter", __func__);
+	i_debug("openchange: %s enter", __func__);
 	mail_storage_hooks_remove(&openchange_mail_storage_hooks);
 	notify_unregister(openchange_ctx);
-	i_debug("%s: exit", __func__);
+	i_debug("openchange: %s exit", __func__);
 }
 
