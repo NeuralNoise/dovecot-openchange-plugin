@@ -30,6 +30,7 @@
 #include <dovecot/notify-plugin.h>
 #include <amqp.h>
 #include <amqp_tcp_socket.h>
+#include <json-c/json.h>
 
 #define	OPENCHANGE_USER_CONTEXT(obj) \
 	MODULE_CONTEXT(obj, openchange_user_module)
@@ -265,18 +266,25 @@ openchange_broker_connect(struct openchange_user *user)
 }
 
 /**
- * Publish a new message
+ * Publish a new message, JSON serialized.
  */
 	static bool
 openchange_publish(const struct openchange_user *user, const struct openchange_message *msg)
 {
 	amqp_rpc_reply_t r;
-	amqp_bytes_t payload;
 	int ret;
 
 	if (user->broker_conn != NULL) {
-		payload.len = 0;
-		payload.bytes = NULL;
+		json_object *jobj, *juser, *jfolder, *juid;
+
+		jobj = json_object_new_object();
+		juser = json_object_new_string(user->username);
+		jfolder = json_object_new_string(msg->destination_folder);
+		juid = json_object_new_int(msg->uid);
+
+		json_object_object_add(jobj, "user", juser);
+		json_object_object_add(jobj, "folder", jfolder);
+		json_object_object_add(jobj, "uid", juid);
 
 		ret = amqp_basic_publish(user->broker_conn,
 			1,
@@ -285,12 +293,15 @@ openchange_publish(const struct openchange_user *user, const struct openchange_m
 			0,	/* Mandatory */
 			0,	/* Inmediate */
 			NULL,	/* Properties */
-			payload);
+			amqp_cstring_bytes(json_object_to_json_string(jobj)));
 		if (ret != AMQP_STATUS_OK) {
 			i_error("openchange: Failed to publish: %s",
 				amqp_error_string2(ret));
 			return FALSE;
 		}
+
+		/* Free memory */
+		json_object_put(jobj);
 	}
 
 	return TRUE;

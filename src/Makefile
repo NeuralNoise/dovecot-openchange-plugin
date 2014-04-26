@@ -13,7 +13,7 @@ all: build
 build: ${PLUGIN_NAME}
 
 ${PLUGIN_NAME}: ${PLUGIN_SOURCES}
-	gcc  -fPIC -shared -DHAVE_CONFIG_H openchange-plugin.c -o ${PLUGIN_NAME} -lrabbitmq
+	gcc  -fPIC -shared -DHAVE_CONFIG_H openchange-plugin.c -o ${PLUGIN_NAME} -lrabbitmq -ljson-c
 
 install: install_plugin
 
