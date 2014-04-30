@@ -262,6 +262,26 @@ openchange_broker_connect(struct openchange_user *user)
 		return FALSE;
 	}
 
+	/* If a message is published to a exchange that does not exists,
+	 * librabbitmq closes the whole connection so declare it */
+	i_debug("openchange: Declaring exchange %s", user->broker_exchange);
+	amqp_exchange_declare(
+		user->broker_conn,
+		1,	/* Channel */
+		amqp_cstring_bytes(user->broker_exchange),
+		amqp_cstring_bytes("direct"),
+		0,	/* Passive */
+		0,	/* Durable */
+		amqp_empty_table);
+	r = amqp_get_rpc_reply(user->broker_conn);
+	if (r.reply_type != AMQP_RESPONSE_NORMAL) {
+		char buffer[512];
+		openchange_broker_err(buffer, sizeof(buffer), r);
+		i_error("openchange: Failed to declare exchange: %s", buffer);
+		openchange_broker_disconnect(user);
+		return FALSE;
+	}
+
 	return TRUE;
 }
 
