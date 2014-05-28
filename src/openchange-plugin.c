@@ -19,6 +19,7 @@
 
 #include "openchange-plugin.h"
 #include <stdio.h>
+#include <dovecot/config.h>
 #include <dovecot/lib.h>
 #include <dovecot/compat.h>
 #include <dovecot/llist.h>
@@ -306,6 +307,7 @@ openchange_publish(const struct openchange_user *user, const struct openchange_m
 		json_object_object_add(jobj, "folder", jfolder);
 		json_object_object_add(jobj, "uid", juid);
 
+		i_debug("openchange: Publish message to broker '%s' with routing key '%s'", user->broker_exchange, user->broker_routing);
 		ret = amqp_basic_publish(user->broker_conn,
 			1,
 			amqp_cstring_bytes(user->broker_exchange),
@@ -336,6 +338,7 @@ openchange_mail_user_created(struct mail_user *user)
 {
 	struct openchange_user *ocuser;
 	const char *str;
+	char *aux;
 
 	i_debug("openchange: %s enter", __func__);
 	ocuser = p_new(user->pool, struct openchange_user, 1);
@@ -343,7 +346,11 @@ openchange_mail_user_created(struct mail_user *user)
 
 	ocuser->fields = OPENCHANGE_DEFAULT_FIELDS;
 	ocuser->events = OPENCHANGE_DEFAULT_EVENTS;
-	ocuser->username = p_strdup(user->pool, user->username);
+
+	/* Strip @domain.com from username */
+	aux = i_strdup(user->username);
+	ocuser->username = i_strdup(strtok(aux, "@"));
+	free(aux);
 
 	/* Read plugin configuration and store in module context */
 	str = mail_user_plugin_getenv(user, "openchange_broker_host");
