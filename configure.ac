@@ -1,0 +1,21 @@
+AC_PREREQ(2.65)
+AC_INIT([dovecot-openchange],[0.1],[scabrero@zentyal.com])
+
+AM_INIT_AUTOMAKE([1.10 silent-rules])
+
+AM_MAINTAINER_MODE
+PKG_PROG_PKG_CONFIG
+
+AC_CONFIG_MACRO_DIR([m4])
+AC_CONFIG_SRCDIR([src])
+AC_CONFIG_FILES([Makefile src/Makefile])
+
+AC_PROG_CC_STDC
+LT_INIT
+
+DC_DOVECOT([2.0])
+
+PKG_CHECK_MODULES(RABBITMQ, librabbitmq >= 0.4.1)
+PKG_CHECK_MODULES(JSONC, json-c >= 0.11.99)
+
+AC_OUTPUT
