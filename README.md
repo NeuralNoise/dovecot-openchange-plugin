@@ -1,7 +1,4 @@
-Packaging only repo
--------------------
-
-Packaging for the follow code:
+Packaging for the following code:
 
 [Dovecot mail notification plugin for OpenChange]
 
