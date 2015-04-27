@@ -1,8 +1,8 @@
 Source: dovecot-openchange-plugin
 Priority: optional
 Maintainer: Samuel Cabrero <scabrero@zentyal.com>
-Build-Depends: debhelper (>= 8.0.0), automake, libtool, dovecot-dev (>= 1:2.1),
- librabbitmq-dev, libjson-c-dev, pkg-config, libssl-dev
+Build-Depends: debhelper (>= 8.0.0), dovecot-dev (>= 1:2.1),
+ libmapistore (>= 2.2), libnanomsg-dev (>= 0.5)
 Standards-Version: 3.9.4
 Section: mail
 Homepage: http://www.openchange.org
@@ -13,6 +13,6 @@ Section: mail
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: OpenChange dovecot plugin
- This is a plugin for dovecot 2.0 that send a message to a AMQP broker when
- a new mail arrives for a user. It works together with OpenChange notification
- daemon to send notification to email clients.
+ This is a plugin for dovecot 2.2 that allow OpenChange server
+ to notify Outlook whenever an event for which the user
+ subscribed has occured on the server.
