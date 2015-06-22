@@ -1,3 +1,9 @@
+dovecot-openchange-plugin (0.2-zentyalcloud1) trusty; urgency=medium
+
+  * Testing version
+
+ -- Jenkins Zentyal (Zentyal GPG) <jenkins@zentyal.com>  Mon, 22 Jun 2015 08:27:11 +0200
+
 dovecot-openchange-plugin (0.2-zentyalcloud) trusty; urgency=medium
 
   * New version for Zentyal Cloud deployments
