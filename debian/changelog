@@ -1,3 +1,10 @@
+dovecot-openchange-plugin (0.4) trusty; urgency=medium
+
+  * Initialize mapistore notification context indicating that we are in a
+  threading environment
+
+ -- Jenkins Zentyal (Zentyal GPG) <jenkins@zentyal.com>  Wed, 26 Aug 2015 15:38:03 +0200
+
 dovecot-openchange-plugin (0.3) trusty; urgency=medium
 
   * New version from Openchange master
