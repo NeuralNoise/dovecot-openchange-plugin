@@ -1,4 +1,4 @@
-dovecot-openchange-plugin (0.5-zentyalcloud) trusty; urgency=medium
+dovecot-openchange-plugin (0.5~zentyalcloud) trusty; urgency=medium
 
   * Removed openchange_cn option, always using email
 
